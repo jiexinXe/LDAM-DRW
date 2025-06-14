@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 from sklearn.metrics import confusion_matrix
 from utils import *
 from imbalance_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
-from losses import LDAMLoss, FocalLoss
+from losses import LDAMLoss, FocalLoss, RLRedundancyLoss
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -160,6 +160,13 @@ def main_worker(gpu, ngpus_per_node, args):
         warnings.warn('Dataset is not listed')
         return
     cls_num_list = train_dataset.get_cls_num_list()
+
+    # —— 定义头部类别（样本数大于平均数）& 初始化上轮 per-class 精度 ——
+    mean_count   = sum(cls_num_list) / len(cls_num_list)
+    head_classes = [i for i, n in enumerate(cls_num_list) if n > mean_count]
+    prev_cls_acc = [0.0] * len(cls_num_list)
+
+
     print('cls num list:')
     print(cls_num_list)
     args.cls_num_list = cls_num_list
@@ -213,6 +220,15 @@ def main_worker(gpu, ngpus_per_node, args):
             criterion = LDAMLoss(cls_num_list=cls_num_list, max_m=0.5, s=30, weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'Focal':
             criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(args.gpu)
+        elif args.loss_type == 'RLRedund':
+            # 只保留冗余样本降权 + RL 动态类权重
+            criterion = RLRedundancyLoss(
+                num_classes = len(cls_num_list),
+                head_classes = head_classes,
+                alpha_r = 0.1,  # 冗余头部样本降权
+                tau = 0.3,  # 冗余判断阈值
+                rl_eta = 0.5  # RL 更新灵敏度
+            ).cuda(args.gpu)
         else:
             warnings.warn('Loss type is not listed')
             return
@@ -221,7 +237,15 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args, log_training, tf_writer)
         
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+        # acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+        # evaluate on validation set，获取 top1 和 per-class accuracy
+        acc1, cls_acc = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+
+        # 如果在用 RLRedundancyLoss，就更新 class_rl_weight
+
+        if args.loss_type == 'RLRedund':
+            criterion.update_rl_weights(cls_acc, prev_cls_acc)
+            prev_cls_acc = cls_acc
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -361,7 +385,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
         tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
         tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
 
-    return top1.avg
+    # return top1.avg
+    return top1.avg, cls_acc
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
