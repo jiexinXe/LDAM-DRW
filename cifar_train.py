@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 from sklearn.metrics import confusion_matrix
 from utils import *
 from imbalance_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
-from losses import LDAMLoss, FocalLoss
+from losses import LDAMLoss, FocalLoss, RLHybridSPFocalLoss
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -163,6 +163,13 @@ def main_worker(gpu, ngpus_per_node, args):
     print('cls num list:')
     print(cls_num_list)
     args.cls_num_list = cls_num_list
+
+    # 6.14添加
+    # —— 定义头部类别（示例：样本数大于平均数的类）——
+    mean_count = sum(cls_num_list) / len(cls_num_list)
+    head_classes = [i for i, n in enumerate(cls_num_list) if n > mean_count]
+    # 上一轮的 per-class 验证精度，初始全 0
+    prev_cls_acc = [0.0] * len(cls_num_list)
     
     train_sampler = None
         
@@ -213,6 +220,14 @@ def main_worker(gpu, ngpus_per_node, args):
             criterion = LDAMLoss(cls_num_list=cls_num_list, max_m=0.5, s=30, weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'Focal':
             criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(args.gpu)
+        elif args.loss_type == 'RLHybrid':
+            criterion = RLHybridSPFocalLoss(
+                num_classes = len(cls_num_list),
+                head_classes = head_classes,
+                gamma0 = 2.0, alpha_r = 0.1, tau = 0.2,
+                lambda_max = 1.0, total_epochs = args.epochs,
+                ema_decay = 0.9, rl_eta = 0.5
+            ).cuda(args.gpu)
         else:
             warnings.warn('Loss type is not listed')
             return
@@ -222,6 +237,14 @@ def main_worker(gpu, ngpus_per_node, args):
         
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+
+        # 6.14添加
+        # evaluate on validation set，获取 per-class acc
+        acc1, cls_acc = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+        # 如果使用了 RLHybrid，更新其 class_rl_weight
+        if args.loss_type == 'RLHybrid':
+            criterion.update_rl_weights(cls_acc, prev_cls_acc)
+            prev_cls_acc = cls_acc
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -263,7 +286,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer
 
         # compute output
         output = model(input)
-        loss = criterion(output, target)
+        # loss = criterion(output, target)
+        loss = criterion(output, target, epoch)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -317,7 +341,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
 
             # compute output
             output = model(input)
-            loss = criterion(output, target)
+            # loss = criterion(output, target)
+            loss = criterion(output, target, epoch)
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -361,7 +386,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
         tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
         tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
 
-    return top1.avg
+    # return top1.avg
+    return top1.avg, cls_acc.tolist()
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
