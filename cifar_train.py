@@ -221,13 +221,13 @@ def main_worker(gpu, ngpus_per_node, args):
         elif args.loss_type == 'Focal':
             criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(args.gpu)
         elif args.loss_type == 'RLRedund':
-            # 只保留冗余样本降权 + RL 动态类权重
             criterion = RLRedundancyLoss(
                 num_classes = len(cls_num_list),
                 head_classes = head_classes,
                 alpha_r = 0.1,  # 冗余头部样本降权
                 tau = 0.3,  # 冗余判断阈值
-                rl_eta = 0.5  # RL 更新灵敏度
+                rl_eta = 0.5,  # RL 更新灵敏度
+                alpha_comb = 0.6  # 权重融合系数：越大偏向冗余降权，越小偏向RL权重
             ).cuda(args.gpu)
         else:
             warnings.warn('Loss type is not listed')

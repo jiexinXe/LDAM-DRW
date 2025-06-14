@@ -6,53 +6,49 @@ import numpy as np
 
 class RLRedundancyLoss(nn.Module):
     """
-    仅基于“头部冗余样本降权”和“基于 per-class 精度增量的 RL 权重”。
-    Loss = w_sp * w_rl[c] * CE
+    仅保留冗余样本降权 + RL 动态类权重，并使用加权和融合这两种权重。
+    Loss = (alpha_comb * w_sp + (1 - alpha_comb) * w_rl) * CE
     """
-    def __init__(self, num_classes, head_classes, alpha_r=0.1, tau=0.2, rl_eta=0.5, eps=1e-6):
+    def __init__(self, num_classes, head_classes,
+                 alpha_r=0.1, tau=0.2, rl_eta=0.5,
+                 alpha_comb=0.5, eps=1e-6):
         super().__init__()
         self.num_classes = num_classes
         self.head_classes = set(head_classes)
         self.alpha_r = alpha_r
         self.tau = tau
         self.rl_eta = rl_eta
+        self.alpha_comb = alpha_comb
         self.eps = eps
-
-        # 初始化 RL 动态权重
         self.register_buffer('class_rl_weight', torch.ones(num_classes))
 
     def forward(self, logits, targets):
-        """
-        logits: [N,C], targets: [N]
-        """
         probs = F.softmax(logits, dim=1)
         p_t = probs.gather(1, targets.view(-1,1)).squeeze(1)
         loss_ce = -torch.log(p_t + self.eps)
 
-        # 1) 冗余样本降权：当 loss < tau 且属于头部类时，权重 = alpha_r；否则权重 = 1
+        # 1) 冗余样本降权
         w_sp = torch.ones_like(loss_ce)
-        head_mask = torch.tensor([t in self.head_classes for t in targets],
-                                 device=logits.device)
+        head_mask = torch.tensor([t in self.head_classes for t in targets], device=logits.device)
         redundant = (loss_ce < self.tau) & head_mask
         w_sp = torch.where(redundant, self.alpha_r, w_sp)
 
         # 2) RL 动态类权重
         w_rl = self.class_rl_weight[targets]
 
+        # 3) 加权和融合
+        w_comb = self.alpha_comb * w_sp + (1 - self.alpha_comb) * w_rl
+
         # 最终 Loss
-        loss = w_sp * w_rl * loss_ce
+        loss = w_comb * loss_ce
         return loss.mean()
 
     @torch.no_grad()
     def update_rl_weights(self, val_acc, prev_val_acc):
-        """
-        每个 epoch 验证后调用，根据 per-class 准确率增量更新权重。
-        val_acc, prev_val_acc: 长度=num_classes 的列表或数组
-        """
         for c in range(self.num_classes):
             delta = max(0.0, val_acc[c] - prev_val_acc[c])
             self.class_rl_weight[c] *= math.exp(self.rl_eta * delta)
-           # 归一化到 sum = num_classes，避免权重漂移
+        # 归一化到 sum = num_classes
         self.class_rl_weight *= (self.num_classes / self.class_rl_weight.sum())
 
 def focal_loss(input_values, gamma):
